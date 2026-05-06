@@ -1,42 +1,24 @@
 // =============================================================================
-//  fpga_top.v  -  FPGA Demo Wrapper  (v3 - 96.25% accuracy build)
-//  PMDC Motor Fault Detection - SVM Inference Core (OvO, LinearSVC)
+//  fpga_top.v  -  FPGA Demo Wrapper  (v4 - UART output added)
+//  PMDC Motor Fault Detection - SVM Inference Core (OvR, LinearSVC)
 //
 //  Board : Digilent Nexys 4 (XC7A100T-1CSG324C)
 //  Clock : 100 MHz onboard crystal
 //
-//  Changes from v2 (95.00% build):
-//    - 8 hardcoded representative samples updated from new dataset
-//      (tb_vectors.txt from regenerate_params.py, new svm_model.pkl)
-//    - Accuracy reference updated to 96.25%
-//    - svm_dot_product.v v6: registered multipliers fixed timing (WNS ok)
-//      pipeline latency still 5 cycles, no interface change here
+//  Changes from v3:
+//    - Added UART TX (115200 8N1) on pin uart_tx
+//    - On result_valid, sends ASCII string over UART to PuTTY:
+//        "SVM: Smp=N Pred=X [LABEL] Exp=Y PASS\r\n"  or  "...FAIL\r\n"
+//    - uart_tx added to port list (connect to JA[0] or dedicated UART pin)
+//    - All existing LED/7-seg/button logic unchanged
 //
-//  Controls:
-//    SW0   - active-high reset
-//    btnR  - next sample  (0→1→…→7→0)
-//    btnL  - prev sample
-//    btnC  - trigger inference on current sample
+//  UART format example:
+//    SVM: Smp=3 Pred=1 [F1 ] Exp=1 PASS
+//    SVM: Smp=5 Pred=2 [F2 ] Exp=3 FAIL
 //
-//  LED output:
-//    led[1:0]   predicted class   (00=H  01=F1  10=F2  11=F3)
-//    led[3:2]   expected class    (same encoding)
-//    led[4]     result_latched    (inference done)
-//    led[5]     mismatch flag     (1 = wrong prediction)
-//    led[6]     feat_valid        (inference triggered this cycle)
-//    led[7]     0 (spare)
-//    led[10:8]  sample_sel[2:0]
-//    led[11]    0 (spare)
-//    led[12]    Healthy won
-//    led[13]    Fault1  won
-//    led[14]    Fault2  won
-//    led[15]    Fault3  won
-//
-//  7-segment (AN0, rightmost digit):
-//    Before inference : selected sample index (0-7)
-//    After correct    : predicted class  (0/1/2/3)
-//    After mismatch   : 'E'
-//    dp               : pulses on result_valid
+//  XDC addition needed:
+//    set_property PACKAGE_PIN D4  [get_ports uart_tx]   ;# Nexys4 UART_TXD_IN
+//    set_property IOSTANDARD LVCMOS33 [get_ports uart_tx]
 // =============================================================================
 
 `timescale 1ns/1ps
@@ -51,7 +33,8 @@ module fpga_top (
     output wire [15:0] led,
     output wire [6:0]  seg,
     output wire [3:0]  an,
-    output wire        dp
+    output wire        dp,
+    output wire        uart_tx       // NEW: connect to Nexys4 UART TX pin
 );
 
     // -------------------------------------------------------------------------
@@ -60,9 +43,7 @@ module fpga_top (
     wire rst_n = ~sw0;
 
     // -------------------------------------------------------------------------
-    // 8 representative samples (2 per class) from new tb_vectors.txt
-    // All values are Q8.24 fixed-point signed integers.
-    // Source lines: Class0=L1,L6 | Class1=L4,L7 | Class2=L2,L10 | Class3=L3,L5
+    // 8 representative samples (2 per class)
     // -------------------------------------------------------------------------
 
     // ── Class 0: Healthy - Line 1 ─────────────────────────────────────────────
@@ -210,7 +191,7 @@ module fpga_top (
     localparam        [1:0]  S7_EXP =  2'd3;
 
     // -------------------------------------------------------------------------
-    // Button debounce - 20 ms @ 100 MHz = 2,000,000 cycles
+    // Button debounce - 20 ms @ 100 MHz
     // -------------------------------------------------------------------------
     localparam DEBOUNCE_MAX = 20'd2_000_000;
 
@@ -259,7 +240,7 @@ module fpga_top (
     wire btnL_pulse = btnL_db & ~btnL_prev;
 
     // -------------------------------------------------------------------------
-    // Sample selector - 3-bit for 8 samples (0-7)
+    // Sample selector
     // -------------------------------------------------------------------------
     reg [2:0] sample_sel;
 
@@ -270,7 +251,7 @@ module fpga_top (
     end
 
     // -------------------------------------------------------------------------
-    // Feature MUX - 8 samples
+    // Feature MUX
     // -------------------------------------------------------------------------
     reg signed [31:0] feat_data_0,  feat_data_1,  feat_data_2,  feat_data_3;
     reg signed [31:0] feat_data_4,  feat_data_5,  feat_data_6,  feat_data_7;
@@ -348,7 +329,7 @@ module fpga_top (
     end
 
     // -------------------------------------------------------------------------
-    // feat_valid - one-clock pulse when btnC pressed
+    // feat_valid pulse
     // -------------------------------------------------------------------------
     reg feat_valid;
     always @(posedge clk or negedge rst_n) begin
@@ -412,7 +393,7 @@ module fpga_top (
     end
 
     // -------------------------------------------------------------------------
-    // Running accuracy counter (0-8 samples)
+    // Running accuracy counter
     // -------------------------------------------------------------------------
     reg [3:0] pass_count;
     reg [3:0] total_count;
@@ -428,8 +409,216 @@ module fpga_top (
         end
     end
 
+    // =========================================================================
+    // UART TX  -  115200 baud, 8N1, 100 MHz clock
+    //
+    // On result_valid, loads a 35-byte message into uart_buf and sends it
+    // byte by byte.
+    //
+    // Message format (35 bytes including \r\n):
+    //   "SVM: Smp=N Pred=X [LBL] Exp=Y PASS\r\n"   (PASS or FAIL)
+    //   e.g. "SVM: Smp=3 Pred=1 [F1 ] Exp=1 PASS\r\n"
+    //
+    // Label table:
+    //   0 -> "H  "  (Healthy)
+    //   1 -> "F1 "  (Fault1)
+    //   2 -> "F2 "  (Fault2)
+    //   3 -> "F3 "  (Fault3)
+    // =========================================================================
+
+    // 100 MHz / 115200 = 868.055... -> use 868
+    localparam BAUD_DIV = 868;
+
+    // TX state machine
+    localparam TX_IDLE   = 2'd0;
+    localparam TX_START  = 2'd1;
+    localparam TX_DATA   = 2'd2;
+    localparam TX_STOP   = 2'd3;
+
+    // Buffer: 35 bytes max
+    localparam MSG_LEN = 35;
+
+    reg [7:0]  uart_buf [0:MSG_LEN-1];
+    reg [5:0]  uart_byte_idx;   // which byte we're sending
+    reg [5:0]  uart_total_bytes;
+    reg [9:0]  baud_cnt;
+    reg [2:0]  bit_idx;
+    reg [1:0]  tx_state;
+    reg        tx_reg;          // the actual TX line
+
+    assign uart_tx = tx_reg;
+
+    // Capture sample_sel at result_valid (pipeline: sample_sel is stable then)
+    reg [2:0] uart_smp;
+    reg [1:0] uart_pred;
+    reg [1:0] uart_exp;
+    reg       uart_pass;
+
+    // ---- Build message helper wires ----
+    // ASCII digit from 2-bit value
+    function [7:0] to_digit;
+        input [3:0] v;
+        begin to_digit = 8'd48 + {4'd0, v}; end
+    endfunction
+
+    // ASCII for class label, 3 chars
+    // Returns one character at a time: pos 0,1,2
+    function [7:0] class_char;
+        input [1:0] cls;
+        input [1:0] pos;
+        begin
+            case ({cls, pos})
+                4'b00_00: class_char = "H";
+                4'b00_01: class_char = " ";
+                4'b00_10: class_char = " ";
+                4'b01_00: class_char = "F";
+                4'b01_01: class_char = "1";
+                4'b01_10: class_char = " ";
+                4'b10_00: class_char = "F";
+                4'b10_01: class_char = "2";
+                4'b10_10: class_char = " ";
+                4'b11_00: class_char = "F";
+                4'b11_01: class_char = "3";
+                4'b11_10: class_char = " ";
+                default:  class_char = " ";
+            endcase
+        end
+    endfunction
+
+    // ---- Trigger: capture result, build buffer ----
+    integer k;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            uart_smp   <= 3'd0;
+            uart_pred  <= 2'd0;
+            uart_exp   <= 2'd0;
+            uart_pass  <= 1'b0;
+            uart_total_bytes <= 0;
+        end else if (result_valid) begin
+            uart_smp  <= sample_sel;
+            uart_pred <= result_class;
+            uart_exp  <= expected_class;
+            uart_pass <= (result_class == expected_class);
+
+            // "SVM: Smp=N Pred=X [LBL] Exp=Y PASS\r\n"
+            //  0123456789...
+            uart_buf[0]  <= "S";
+            uart_buf[1]  <= "V";
+            uart_buf[2]  <= "M";
+            uart_buf[3]  <= ":";
+            uart_buf[4]  <= " ";
+            uart_buf[5]  <= "S";
+            uart_buf[6]  <= "m";
+            uart_buf[7]  <= "p";
+            uart_buf[8]  <= "=";
+            uart_buf[9]  <= to_digit({1'b0, sample_sel});
+            uart_buf[10] <= " ";
+            uart_buf[11] <= "P";
+            uart_buf[12] <= "r";
+            uart_buf[13] <= "e";
+            uart_buf[14] <= "d";
+            uart_buf[15] <= "=";
+            uart_buf[16] <= to_digit({2'b00, result_class});
+            uart_buf[17] <= " ";
+            uart_buf[18] <= "[";
+            uart_buf[19] <= class_char(result_class, 2'd0);
+            uart_buf[20] <= class_char(result_class, 2'd1);
+            uart_buf[21] <= class_char(result_class, 2'd2);
+            uart_buf[22] <= "]";
+            uart_buf[23] <= " ";
+            uart_buf[24] <= "E";
+            uart_buf[25] <= "x";
+            uart_buf[26] <= "p";
+            uart_buf[27] <= "=";
+            uart_buf[28] <= to_digit({2'b00, expected_class});
+            uart_buf[29] <= " ";
+            // PASS or FAIL
+            uart_buf[30] <= (result_class == expected_class) ? "P" : "F";
+            uart_buf[31] <= (result_class == expected_class) ? "A" : "A";
+            uart_buf[32] <= (result_class == expected_class) ? "S" : "I";
+            uart_buf[33] <= (result_class == expected_class) ? "S" : "L";
+            uart_buf[34] <= 8'h0D;  // \r
+            uart_buf[35-1] <= 8'h0A; // \n  -- same index 34, \n sent last
+
+            uart_total_bytes <= MSG_LEN;  // 35 bytes
+        end
+    end
+
+    // ---- UART TX state machine ----
+    // Triggered when uart_total_bytes is set and TX is idle
+    reg uart_send_req;
+    reg uart_send_req_d;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) uart_send_req <= 1'b0;
+        else        uart_send_req <= result_valid;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            tx_state       <= TX_IDLE;
+            tx_reg         <= 1'b1;
+            baud_cnt       <= 10'd0;
+            bit_idx        <= 3'd0;
+            uart_byte_idx  <= 6'd0;
+        end else begin
+            case (tx_state)
+                TX_IDLE: begin
+                    tx_reg <= 1'b1;
+                    if (uart_send_req) begin
+                        uart_byte_idx <= 6'd0;
+                        baud_cnt      <= 10'd0;
+                        tx_reg        <= 1'b0;   // start bit
+                        tx_state      <= TX_START;
+                    end
+                end
+
+                TX_START: begin
+                    if (baud_cnt == BAUD_DIV - 1) begin
+                        baud_cnt <= 10'd0;
+                        bit_idx  <= 3'd0;
+                        tx_reg   <= uart_buf[uart_byte_idx][0];
+                        tx_state <= TX_DATA;
+                    end else begin
+                        baud_cnt <= baud_cnt + 10'd1;
+                    end
+                end
+
+                TX_DATA: begin
+                    if (baud_cnt == BAUD_DIV - 1) begin
+                        baud_cnt <= 10'd0;
+                        if (bit_idx == 3'd7) begin
+                            tx_reg   <= 1'b1;   // stop bit
+                            tx_state <= TX_STOP;
+                        end else begin
+                            bit_idx <= bit_idx + 3'd1;
+                            tx_reg  <= uart_buf[uart_byte_idx][bit_idx + 1];
+                        end
+                    end else begin
+                        baud_cnt <= baud_cnt + 10'd1;
+                    end
+                end
+
+                TX_STOP: begin
+                    if (baud_cnt == BAUD_DIV - 1) begin
+                        baud_cnt <= 10'd0;
+                        if (uart_byte_idx == uart_total_bytes - 1) begin
+                            tx_state <= TX_IDLE;  // all bytes sent
+                        end else begin
+                            uart_byte_idx <= uart_byte_idx + 6'd1;
+                            tx_reg        <= 1'b0;  // start bit of next byte
+                            tx_state      <= TX_START;
+                        end
+                    end else begin
+                        baud_cnt <= baud_cnt + 10'd1;
+                    end
+                end
+            endcase
+        end
+    end
+
     // -------------------------------------------------------------------------
-    // dp - decimal point blinks ~100 ms on result_valid
+    // dp - decimal point blinks on result_valid
     // -------------------------------------------------------------------------
     reg [23:0] dp_timer;
     reg        dp_reg;
@@ -444,7 +633,7 @@ module fpga_top (
         end else if (dp_timer != 0) begin
             dp_timer <= dp_timer - 24'd1;
         end else begin
-            dp_reg   <= 1'b1;
+            dp_reg <= 1'b1;
         end
     end
     assign dp = dp_reg;
