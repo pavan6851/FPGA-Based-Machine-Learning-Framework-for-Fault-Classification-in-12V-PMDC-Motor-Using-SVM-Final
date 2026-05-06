@@ -123,6 +123,11 @@ set_false_path -to [get_ports {seg[*]}]
 set_false_path -to [get_ports {an[*]}]
 set_false_path -to [get_ports dp]
 
+## -- UART TX ------------------------------------------------------------------
+set_property PACKAGE_PIN D4        [get_ports uart_tx]
+set_property IOSTANDARD  LVCMOS33  [get_ports uart_tx]
+set_false_path -to [get_ports uart_tx]
+
 ## =============================================================================
 ##  End of constraints
 ## =============================================================================
